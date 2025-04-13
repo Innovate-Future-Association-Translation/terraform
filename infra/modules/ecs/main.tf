@@ -1,136 +1,184 @@
+# Terraform 模块：创建 DevOps 项目的 VPC + ECS（Fargate）部署结构
+
 provider "aws" {
-  region = var.aws_region
-}
-# define Cluster
-resource "aws_ecs_cluster" "ecs_cluster" {
-  name = "${var.name_prefix}-cluster"
+  region = "ap-southeast-2"
 }
 
-data "aws_caller_identity" "current" {}
-
-# 动态构建 ARN
-locals {
-  ecs_task_execution_role_arn = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.ecs_task_execution_role_name}"
-  ecs_autoscale_role_arn      = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.ecs_autoscale_role_name}"
-}
-
-resource "aws_ecs_task_definition" "ecs_task" {
-  family                   = "${var.name_prefix}-task"
-  execution_role_arn       = local.ecs_task_execution_role_arn
-  network_mode             = "awsvpc"
-  requires_compatibilities = ["FARGATE"]
-  cpu                      = var.fargate_cpu
-  memory                   = var.fargate_memory
-  container_definitions = templatefile("${path.module}/container-definitions.json.tpl", {
-    app_image      = var.app_image
-    fargate_cpu    = var.fargate_cpu
-    fargate_memory = var.fargate_memory
-    aws_region     = var.aws_region
-    container_port = var.container_port
-    prefix         = var.name_prefix
-    # host_port      = var.host_port
-  })
-
-}
-
-resource "aws_cloudwatch_log_group" "container" {
-  name = "${var.name_prefix}-awslogs-api"
-
-}
-
-# define Service
-resource "aws_ecs_service" "ecs_service" {
-  name            = "${var.name_prefix}-service"
-  cluster         = aws_ecs_cluster.ecs_cluster.id
-  task_definition = aws_ecs_task_definition.ecs_task.arn
-  desired_count   = var.min_capacity
-  launch_type     = "FARGATE"
-
-  network_configuration {
-    security_groups  = ["${aws_security_group.ecs_tasks_sg.id}"]
-    subnets          = var.vpc_private_subnets
-    assign_public_ip = false
-  }
-
-  load_balancer {
-    target_group_arn = aws_lb_target_group.alb_target_group.id
-    container_name   = var.balanced_container_name
-    container_port   = var.container_port
-  }
-
-}
-
-
-# define tg
-resource "aws_lb_target_group" "alb_target_group" {
-  name        = "${var.name_prefix}-alb-target-group"
-  port        = var.container_port
-  protocol    = var.alb_protocol
-  vpc_id      = var.infra_vpc_id
-  target_type = "ip"
-
-  health_check {
-    healthy_threshold   = "3"
-    unhealthy_threshold = "3"
-    timeout             = "3"
-    interval            = "5"
-    protocol            = var.alb_protocol
-    matcher             = "200"
-    path                = var.healthcheck_path
-  }
-}
-
-resource "aws_lb_listener_rule" "ecs_forward" {
-  listener_arn = var.alb_https_listener
-  priority     = 110
-
-  action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.alb_target_group.arn
-  }
-
-  condition {
-    host_header {
-      values = ["${var.api_domain_name}.*"]
-    }
-  }
-
-}
-
-
-# define Log Group
-resource "aws_cloudwatch_log_group" "log_group" {
-  name = "/ecs/${var.name_prefix}"
-
+# --------------------------
+# VPC 和网络部分
+# --------------------------
+resource "aws_vpc" "devops_vpc" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_hostnames = true
   tags = {
-    Name = "antoneo-api"
+    Name = "devops-vpc"
   }
 }
 
-# define Log stream
-resource "aws_cloudwatch_log_stream" "log_stream" {
-  name           = "${var.name_prefix}-log-stream"
-  log_group_name = aws_cloudwatch_log_group.log_group.name
+resource "aws_subnet" "public_a" {
+  vpc_id                  = aws_vpc.devops_vpc.id
+  cidr_block              = "10.0.1.0/24"
+  availability_zone       = "ap-southeast-2a"
+  map_public_ip_on_launch = true
+  tags = {
+    Name = "public-subnet-a"
+  }
 }
 
+resource "aws_subnet" "public_b" {
+  vpc_id                  = aws_vpc.devops_vpc.id
+  cidr_block              = "10.0.2.0/24"
+  availability_zone       = "ap-southeast-2b"
+  map_public_ip_on_launch = true
+  tags = {
+    Name = "public-subnet-b"
+  }
+}
 
-# ECS tasks security group
-resource "aws_security_group" "ecs_tasks_sg" {
-  name   = "${var.name_prefix}-ecs-tasks-sg"
-  vpc_id = var.app_vpc_id
+resource "aws_internet_gateway" "igw" {
+  vpc_id = aws_vpc.devops_vpc.id
+  tags = {
+    Name = "igw-devops"
+  }
+}
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.devops_vpc.id
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.igw.id
+  }
+  tags = {
+    Name = "public-route"
+  }
+}
+
+resource "aws_route_table_association" "a" {
+  subnet_id      = aws_subnet.public_a.id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_route_table_association" "b" {
+  subnet_id      = aws_subnet.public_b.id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_security_group" "ecs_allow" {
+  name        = "ecs-allow"
+  description = "allows rules for devops vpc"
+  vpc_id      = aws_vpc.devops_vpc.id
 
   ingress {
+    from_port   = 80
+    to_port     = 80
     protocol    = "tcp"
-    from_port   = var.container_port
-    to_port     = var.container_port
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  ingress {
+    from_port   = 8000
+    to_port     = 8000
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
 
   egress {
-    protocol    = "-1"
     from_port   = 0
     to_port     = 0
+    protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
+
+  tags = {
+    Name = "ecs-allow"
+  }
+}
+
+# --------------------------
+# ECS Fargate 相关资源
+# --------------------------
+resource "aws_ecs_cluster" "translator" {
+  name = "translator-cluster"
+}
+
+resource "aws_iam_role" "ecs_task_execution" {
+  name = "ecsTaskExecutionRoleTerraform"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ecs-tasks.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_execution_attach" {
+  role       = aws_iam_role.ecs_task_execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+variable "env_vars" {
+  type = map(string)
+}
+
+variable "image_tag" {
+  type    = string
+  default = "latest"
+}
+
+resource "aws_ecs_task_definition" "translator" {
+  family                   = "translator-task"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "512"
+  memory                   = "1024"
+  execution_role_arn       = aws_iam_role.ecs_task_execution.arn
+
+  container_definitions = jsonencode([
+    {
+      name      = "translator-api"
+      image     = "730335329548.dkr.ecr.ap-southeast-2.amazonaws.com/translator-api:${var.image_tag}"
+      portMappings = [
+        {
+          containerPort = 8000
+          hostPort      = 8000
+        }
+      ]
+      essential = true
+      environment = [
+        for key, value in var.env_vars : {
+          name  = key
+          value = value
+        }
+      ]
+    }
+  ])
+}
+
+resource "aws_ecs_service" "translator" {
+  name            = "translator-service"
+  cluster         = aws_ecs_cluster.translator.id
+  task_definition = aws_ecs_task_definition.translator.arn
+  launch_type     = "FARGATE"
+  desired_count   = 1
+
+  network_configuration {
+    subnets          = [aws_subnet.public_a.id, aws_subnet.public_b.id]
+    assign_public_ip = true
+    security_groups  = [aws_security_group.ecs_allow.id]
+  }
+
+  depends_on = [aws_iam_role_policy_attachment.ecs_execution_attach]
 }
