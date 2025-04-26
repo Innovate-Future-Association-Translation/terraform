@@ -1,28 +1,22 @@
-# main.tf
 provider "aws" {
-  region = "ap-southeast-2"
+  region = var.aws_region
 }
 
-# bucket name
 resource "random_id" "bucket_suffix" {
   byte_length = 4
 }
 
-#  S3 Bucket
 resource "aws_s3_bucket" "frontend_bucket" {
-  bucket = "frontend-site-${random_id.bucket_suffix.hex}"
+  bucket = "${var.bucket_name_prefix}-${random_id.bucket_suffix.hex}"
 
   website {
     index_document = "index.html"
     error_document = "404.html"
   }
 
-  tags = {
-    Name = "FrontendHosting"
-  }
+  tags = var.tags
 }
 
-#  S3 Object Ownership
 resource "aws_s3_bucket_ownership_controls" "ownership" {
   bucket = aws_s3_bucket.frontend_bucket.id
 
@@ -31,7 +25,6 @@ resource "aws_s3_bucket_ownership_controls" "ownership" {
   }
 }
 
-# 
 resource "aws_s3_bucket_public_access_block" "public_access" {
   bucket                  = aws_s3_bucket.frontend_bucket.id
   block_public_acls       = false
@@ -40,7 +33,6 @@ resource "aws_s3_bucket_public_access_block" "public_access" {
   restrict_public_buckets = false
 }
 
-#  Bucket Policy 
 resource "aws_s3_bucket_policy" "public_read" {
   bucket = aws_s3_bucket.frontend_bucket.id
 
@@ -59,7 +51,6 @@ resource "aws_s3_bucket_policy" "public_read" {
   depends_on = [aws_s3_bucket_public_access_block.public_access]
 }
 
-# 
 resource "aws_s3_bucket_object" "frontend_files" {
   for_each = fileset("out", "**")
 
@@ -85,8 +76,5 @@ resource "aws_s3_bucket_object" "frontend_files" {
     "application/octet-stream"
   )
 
-  depends_on = [
-    aws_s3_bucket_policy.public_read
-  ]
+  depends_on = [aws_s3_bucket_policy.public_read]
 }
-
